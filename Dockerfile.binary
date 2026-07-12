@@ -22,7 +22,7 @@ RUN \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
     apt-get update && \
-    apt-get install -yq --no-install-recommends ca-certificates curl jq xz-utils make libclang-19-dev
+    apt-get install -yq --no-install-recommends ca-certificates curl jq xz-utils make cmake pkg-config libclang-19-dev
 
 RUN \
     ZIG_VERSION=0.13.0 && \
