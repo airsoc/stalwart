@@ -77,6 +77,20 @@ RUN \
     rm -rf fdb-client.deb /fdb
 
 RUN \
+    # Pre-generate zig wrappers and inject system include path
+    # so that cross-compilation (zig cc -target <triple>) can find system headers
+    cargo init /tmp/zw && \
+    cd /tmp/zw && \
+    cargo zigbuild --target ${TARGET} --release 2>/dev/null; \
+    find /root/.cache/cargo-zigbuild -name 'zigcc-*.sh' | while read f; do \
+        sed -i 's|^exec zig cc|exec zig cc -idirafter /usr/include|' "$f"; \
+    done; \
+    find /root/.cache/cargo-zigbuild -name 'zigcxx-*.sh' | while read f; do \
+        sed -i 's|^exec zig c++|exec zig c++ -idirafter /usr/include|' "$f"; \
+    done; \
+    rm -rf /tmp/zw
+
+RUN \
     --mount=type=secret,id=ACTIONS_RESULTS_URL,env=ACTIONS_RESULTS_URL \
     --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN,env=ACTIONS_RUNTIME_TOKEN \
     --mount=type=cache,target=/usr/local/cargo/registry \
