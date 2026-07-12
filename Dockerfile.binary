@@ -35,7 +35,10 @@ RUN cargo binstall --no-confirm cargo-chef cargo-zigbuild
 
 # zig cc for cross-compilation does not search /usr/include by default,
 # so copy curl headers into zig's own lib/include/ for all-target discovery.
-RUN cp -r /usr/include/curl /usr/local/zig-linux-$(uname -m)-0.13.0/lib/include/
+RUN \
+    curl_hdr_dir="$(dpkg -L libcurl4-openssl-dev | grep -m1 '/curl/curl\.h$' | xargs dirname)" && \
+    [ -n "$curl_hdr_dir" ] && [ -d "$curl_hdr_dir" ] && \
+    cp -r "$curl_hdr_dir" /usr/local/zig-linux-$(uname -m)-0.13.0/lib/include/curl
 
 # *****************
 # Planner
