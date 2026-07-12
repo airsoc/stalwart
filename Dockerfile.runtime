@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE
+FROM $BASE_IMAGE
+
+ARG APP_VERSION=dev
+ARG DISTRO_FAMILY=debian
+
+LABEL maintainer="Stalwart Labs LLC <hello@stalw.art>" \
+      vendor="Stalwart Labs LLC" \
+      name="Stalwart Mail Server" \
+      summary="All-in-one mail server (SMTP, IMAP, JMAP, CalDAV, CardDAV)" \
+      description="Stalwart is an open-source all-in-one mail server written in Rust, providing SMTP, IMAP, JMAP, CalDAV, and CardDAV services." \
+      url="https://stalw.art" \
+      io.k8s.description="Stalwart Mail Server" \
+      io.k8s.display-name="Stalwart Mail Server" \
+      io.openshift.tags="mail,smtp,imap,jmap,email,caldav,carddav" \
+      io.openshift.expose-services="443:https,25:smtp,110:pop3,587:submission,465:smtps,143:imap,993:imaps,995:pop3s,4190:managesieve,8080:http" \
+      version="${APP_VERSION}"
+
+COPY stalwart /usr/local/bin/stalwart
+RUN chmod 755 /usr/local/bin/stalwart
+
+# Install libfdb_c.so for FoundationDB support (conditional)
+COPY libfdb_c.so /tmp/libfdb_c.so
+RUN if [ -f /tmp/libfdb_c.so ] && [ -s /tmp/libfdb_c.so ]; then \
+        cp /tmp/libfdb_c.so /usr/lib/libfdb_c.so; \
+        if [ "$DISTRO_FAMILY" = "rhel" ]; then \
+            cp /tmp/libfdb_c.so /lib64/libfdb_c.so; \
+        fi; \
+        ldconfig || true; \
+    fi && \
+    rm -f /tmp/libfdb_c.so
+
+RUN if [ "$DISTRO_FAMILY" = "debian" ]; then \
+        apt-get update && \
+        apt-get install -yq --no-install-recommends ca-certificates curl libcap2-bin && \
+        rm -rf /var/lib/apt/lists/* && \
+        groupadd -r -g 2000 stalwart && \
+        useradd -r -u 2000 -g 0 -s /sbin/nologin -M stalwart && \
+        setcap 'cap_net_bind_service=+ep' /usr/local/bin/stalwart; \
+    elif [ "$DISTRO_FAMILY" = "rhel" ]; then \
+        dnf update -y && \
+        dnf install -y ca-certificates && \
+        dnf clean all && \
+        groupadd -r -g 2000 stalwart && \
+        useradd -r -u 2000 -g 0 -s /sbin/nologin -M stalwart && \
+        ldconfig; \
+    fi
+
+RUN mkdir -p /etc/stalwart /var/lib/stalwart && \
+    chown -R root:0 /etc/stalwart /var/lib/stalwart && \
+    chmod -R 0775 /etc/stalwart /var/lib/stalwart
+
+USER 2000
+WORKDIR /var/lib/stalwart
+VOLUME ["/etc/stalwart", "/var/lib/stalwart"]
+EXPOSE 443 25 110 587 465 143 993 995 4190 8080
+
+ENV STALWART_HEALTHCHECK_URL=https://127.0.0.1:443/healthz/live
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsSk -H "X-Forwarded-For: 127.0.0.1" "$STALWART_HEALTHCHECK_URL" || \
+        curl -fsS -H "X-Forwarded-For: 127.0.0.1" http://127.0.0.1:8080/healthz/live || exit 1
+
+ENTRYPOINT ["/usr/local/bin/stalwart"]
+CMD ["--config", "/etc/stalwart/config.json"]

@@ -1,0 +1,519 @@
+name: "Build Variant Images (FDB)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push images to registries"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags: ["v*.*.*"]
+
+env:
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: sccache
+  CARGO_TERM_COLOR: always
+  AWS_LC_SYS_PREBUILT_NASM: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-fdb:
+    name: Detect FDB Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      fdb_version: ${{ steps.detect.outputs.fdb_version }}
+    steps:
+      - name: Detect latest FoundationDB 7.3.x version
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FDB_VERSION=$(curl --retry 5 -fsSL -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github.v3+json" 'https://api.github.com/repos/apple/foundationdb/releases?per_page=50' | \
+            python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for r in data:
+              if r['tag_name'].startswith('7.3.'):
+                  print(r['tag_name'])
+                  break
+          ")
+          if [ -z "$FDB_VERSION" ]; then FDB_VERSION="7.3.77"; fi
+          echo "Detected FoundationDB version: ${FDB_VERSION}"
+          echo "fdb_version=${FDB_VERSION}" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────
+  # Phase 1: Build all-features binary for each arch
+  # ─────────────────────────────────────────────────────
+  build-binary:
+    name: "Build Binary / ${{ matrix.target }}"
+    needs: [detect-fdb]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            platform: linux/amd64
+            build_env: ""
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            platform: linux/arm64
+            build_env: "JEMALLOC_SYS_WITH_LG_PAGE=16 "
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Free disk space (heavy ARM64 target)
+        if: contains(matrix.target, 'aarch64')
+        run: |
+          df -h /mnt /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /usr/local/share/powershell /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /mnt /
+
+      - name: Add swap (heavy ARM64 target)
+        if: contains(matrix.target, 'aarch64')
+        run: |
+          mnt_avail=$(df --output=avail -k /mnt | tail -1)
+          if [ "$mnt_avail" -lt 18874368 ]; then
+            echo "Insufficient space on /mnt (${mnt_avail}K available), aborting swap setup"
+            exit 1
+          fi
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo sysctl vm.swappiness=80
+          free -h
+          swapon --show
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["https://mirror.gcr.io"]
+          driver-opts: |
+            network=host
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Login to DockerHub
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Calculate shasum of external deps
+        id: cal-dep-shasum
+        run: |
+          echo "checksum=$(yq -p toml -oy '.package[] | select((.source | contains("")) or (.checksum | contains("")))' Cargo.lock | sha256sum | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo
+        uses: actions/cache@v5.0.5
+        id: cargo-cache
+        with:
+          path: |
+            usr-local-cargo-registry
+            usr-local-cargo-git
+          key: cargo-cache-${{ steps.cal-dep-shasum.outputs.checksum }}
+
+      - name: Inject cache into docker
+        uses: reproducible-containers/buildkit-cache-dance@v3.3.2
+        with:
+          cache-map: |
+            {
+              "usr-local-cargo-registry": "/usr/local/cargo/registry",
+              "usr-local-cargo-git": "/usr/local/cargo/git"
+            }
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' crates/main/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "app_version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build all-features binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.binary
+          target: binaries
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          sbom: false
+          build-args: |
+            TARGET=${{ matrix.target }}
+            BUILD_ENV=${{ matrix.build_env }}
+          outputs: type=local,dest=${{ runner.temp }}/binary
+          cache-from: type=gha,scope=binary-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=binary-${{ matrix.arch }}
+
+      - name: List binary outputs
+        run: ls -lh ${{ runner.temp }}/binary/
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/binary/stalwart
+            ${{ runner.temp }}/binary/libfdb_c.so
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────
+  # Phase 2: Build variant runtime images from pre-built binary
+  # ─────────────────────────────────────────────────────
+  build-image:
+    name: "Build Image / ${{ matrix.variant }} / ${{ matrix.arch }}"
+    needs: [build-binary, detect-fdb]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Ubuntu/Debian (amd64 + arm64) ──
+          - variant: ubuntu
+            arch: amd64
+            platform: linux/amd64
+            base_image: docker.io/library/debian:trixie-slim
+            distro_family: debian
+            image_suffix: ""
+            runner: ubuntu-latest
+          - variant: ubuntu
+            arch: arm64
+            platform: linux/arm64
+            base_image: docker.io/library/debian:trixie-slim
+            distro_family: debian
+            image_suffix: "-arm64"
+            runner: ubuntu-latest
+
+          # ── RHEL (官方镜像, amd64, 原生 RHEL runner) ──
+          - variant: rhel9
+            arch: amd64
+            platform: linux/amd64
+            base_image: registry.access.redhat.com/ubi9/ubi:9.8
+            distro_family: rhel
+            image_suffix: "-rhel9"
+            runner: rhel-9
+          - variant: rhel10
+            arch: amd64
+            platform: linux/amd64
+            base_image: registry.access.redhat.com/ubi10:10.2
+            distro_family: rhel
+            image_suffix: "-rhel10"
+            runner: rhel-10
+
+          # ── Rocky Linux (RHEL 兼容, amd64) ──
+          - variant: rocky9
+            arch: amd64
+            platform: linux/amd64
+            base_image: rockylinux/rockylinux:9-ubi
+            distro_family: rhel
+            image_suffix: "-rocky9"
+            runner: rhel-9
+          - variant: rocky10
+            arch: amd64
+            platform: linux/amd64
+            base_image: rockylinux/rockylinux:10.1.20251123-ubi
+            distro_family: rhel
+            image_suffix: "-rocky10"
+            runner: rhel-10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' crates/main/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "app_version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binary
+
+      - name: Prepare Docker build context
+        run: |
+          mkdir -p ${{ runner.temp }}/context
+          cp Dockerfile.runtime ${{ runner.temp }}/context/Dockerfile
+          cp ${{ runner.temp }}/binary/stalwart ${{ runner.temp }}/context/stalwart
+          chmod 755 ${{ runner.temp }}/context/stalwart
+          # Copy libfdb_c.so if it exists (FoundationDB runtime dep)
+          if [ -f "${{ runner.temp }}/binary/libfdb_c.so" ]; then
+            cp ${{ runner.temp }}/binary/libfdb_c.so ${{ runner.temp }}/context/libfdb_c.so
+          elif [ -f "resources/libfdb_c.${{ matrix.arch }}.so" ]; then
+            cp "resources/libfdb_c.${{ matrix.arch }}.so" ${{ runner.temp }}/context/libfdb_c.so
+          fi
+          ls -lh ${{ runner.temp }}/context/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Login to DockerHub
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            index.docker.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag,suffix=${{ matrix.image_suffix }}
+            type=ref,event=branch,prefix=branch-,suffix=${{ matrix.image_suffix }}
+            type=raw,value=fdb-${{ needs.detect-fdb.outputs.fdb_version }},suffix=${{ matrix.image_suffix }}
+            type=semver,pattern=v{{major}}.{{minor}},suffix=${{ matrix.image_suffix }}
+
+      - name: Build and push by digest (GHCR)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context
+          file: ${{ runner.temp }}/context/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          sbom: true
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+            DISTRO_FAMILY=${{ matrix.distro_family }}
+          outputs: type=image,"name=ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=9,oci-mediatypes=true
+          cache-from: type=gha,scope=image-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Push to DockerHub (optional)
+        if: ${{ inputs.push || github.event_name == 'push' }}
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context
+          file: ${{ runner.temp }}/context/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+            DISTRO_FAMILY=${{ matrix.distro_family }}
+          outputs: type=image,"name=index.docker.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=9,oci-mediatypes=true
+          cache-from: type=gha,scope=image-${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ fromJSON(steps.build.outputs.metadata).image['containerimage.digest'] }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ steps.meta.outputs.bake-file }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────
+  # Merge per-platform digests into manifest lists
+  # ─────────────────────────────────────────────────────
+  merge:
+    name: "Merge / ${{ matrix.variant }}"
+    needs: [build-image, detect-fdb]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: ubuntu
+            image_suffix: ""
+            tag_prefix: ""
+          - variant: rhel9
+            image_suffix: "-rhel9"
+            tag_prefix: ""
+          - variant: rhel10
+            image_suffix: "-rhel10"
+            tag_prefix: ""
+          - variant: rocky9
+            image_suffix: "-rocky9"
+            tag_prefix: ""
+          - variant: rocky10
+            image_suffix: "-rocky10"
+            tag_prefix: ""
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Login to DockerHub
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - name: Download metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: meta-${{ matrix.variant }}-amd64
+          path: ${{ runner.temp }}
+
+      - name: Create manifest list and push (GHCR)
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          TAGS=""
+          for tag in $(jq -cr --arg repo "$REPO" '.target."docker-metadata-action".tags | map(select(startswith("ghcr.io/" + $repo))) | .[]' ${{ runner.temp }}/bake-meta.json); do
+            TAGS="$TAGS -t $tag"
+          done
+          docker buildx imagetools create $TAGS \
+            $(printf 'ghcr.io/%s@sha256:%s ' "$REPO" *)
+
+      - name: Create manifest list and push (DockerHub)
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          TAGS=""
+          for tag in $(jq -cr --arg repo "$REPO" '.target."docker-metadata-action".tags | map(select(startswith("index.docker.io/" + $repo))) | .[]' ${{ runner.temp }}/bake-meta.json); do
+            TAGS="$TAGS -t $tag"
+          done
+          docker buildx imagetools create $TAGS \
+            $(printf 'index.docker.io/%s@sha256:%s ' "$REPO" *)
+
+      - name: Inspect images
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ matrix.tag_prefix }}latest || true
+          docker buildx imagetools inspect index.docker.io/${{ github.repository }}:${{ matrix.tag_prefix }}latest || true
+
+      - name: Sign images with Cosign
+        run: |
+          for tag in $(jq -cr '.target."docker-metadata-action".tags | .[]' ${{ runner.temp }}/bake-meta.json); do
+            echo "Signing: $tag"
+            cosign sign --yes "$tag" || true
+          done
+
+  # ─────────────────────────────────────────────────────
+  # Attest build provenance
+  # ─────────────────────────────────────────────────────
+  attest:
+    name: "Attest / ${{ matrix.variant }}"
+    needs: [merge, detect-fdb]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: ubuntu
+            tag_prefix: ""
+          - variant: rhel9
+            tag_prefix: ""
+          - variant: rhel10
+            tag_prefix: ""
+          - variant: rocky9
+            tag_prefix: ""
+          - variant: rocky10
+            tag_prefix: ""
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Get manifest digest
+        id: digest
+        run: |
+          GHCR_DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
+            "ghcr.io/${{ github.repository }}:${{ matrix.tag_prefix }}latest" 2>/dev/null | jq -r '.digest' || true)
+          echo "ghcr_digest=${GHCR_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest GHCR image
+        uses: actions/attest-build-provenance@v4
+        if: steps.digest.outputs.ghcr_digest != '' && steps.digest.outputs.ghcr_digest != 'null'
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digest.outputs.ghcr_digest }}
+          push-to-registry: true

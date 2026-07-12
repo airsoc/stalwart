@@ -48,3 +48,22 @@ target "image" {
     ""
   ]
 }
+
+# All-features binary (sqlite + foundationdb + postgres + mysql + rocks + s3
+# + redis + azure + nats + zenoh + kafka + enterprise)
+target "binary-all" {
+  args = {
+    TARGET = "${TARGET}"
+    BUILD_ENV = equal("", "${BUILD_ENV}") ? null : "${BUILD_ENV}"
+  }
+  target = "binaries"
+  context = "./"
+  dockerfile = "Dockerfile.binary"
+  output = ["./artifact"]
+  cache-from = [
+    "type=gha"
+  ]
+  cache-to = [
+    "type=gha,mode=max"
+  ]
+}
