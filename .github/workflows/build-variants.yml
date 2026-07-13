@@ -170,7 +170,7 @@ jobs:
         run: ls -lh ${{ runner.temp }}/binary/
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: binary-${{ matrix.arch }}
           path: |
@@ -342,7 +342,7 @@ jobs:
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: digests-${{ matrix.variant }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -350,7 +350,7 @@ jobs:
           retention-days: 1
 
       - name: Upload metadata
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: meta-${{ matrix.variant }}-${{ matrix.arch }}
           path: ${{ steps.meta.outputs.bake-file }}
