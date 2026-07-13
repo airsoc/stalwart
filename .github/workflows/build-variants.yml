@@ -210,21 +210,21 @@ jobs:
             image_suffix: "-arm64"
             runner: ubuntu-latest
 
-          # ── RHEL (官方镜像, amd64, 原生 RHEL runner) ──
+          # ── RHEL (官方镜像, amd64) ──
           - variant: rhel9
             arch: amd64
             platform: linux/amd64
             base_image: registry.access.redhat.com/ubi9/ubi:9.8
             distro_family: rhel
             image_suffix: "-rhel9"
-            runner: rhel-9
+            runner: ubuntu-latest
           - variant: rhel10
             arch: amd64
             platform: linux/amd64
             base_image: registry.access.redhat.com/ubi10:10.2
             distro_family: rhel
             image_suffix: "-rhel10"
-            runner: rhel-10
+            runner: ubuntu-latest
 
           # ── Rocky Linux (RHEL 兼容, amd64) ──
           - variant: rocky9
@@ -233,14 +233,14 @@ jobs:
             base_image: rockylinux/rockylinux:9-ubi
             distro_family: rhel
             image_suffix: "-rocky9"
-            runner: rhel-9
+            runner: ubuntu-latest
           - variant: rocky10
             arch: amd64
             platform: linux/amd64
             base_image: rockylinux/rockylinux:10.1.20251123-ubi
             distro_family: rhel
             image_suffix: "-rocky10"
-            runner: rhel-10
+            runner: ubuntu-latest
 
     steps:
       - name: Checkout
