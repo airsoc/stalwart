@@ -101,7 +101,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     source /env-cargo && \
-    RUSTFLAGS="-L /usr/lib" cargo-zigbuild --release --target ${TARGET} -p stalwart && \
+    RUSTFLAGS="-L /usr/lib" cargo-zigbuild build --release --target ${TARGET} -p stalwart && \
     mv /app/target/${TARGET}/release/stalwart /app/artifact/stalwart
 
 # *****************
