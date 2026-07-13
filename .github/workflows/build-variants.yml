@@ -338,7 +338,7 @@ jobs:
       - name: Export digest
         run: |
           mkdir -p ${{ runner.temp }}/digests
-          digest="${{ fromJSON(steps.build.outputs.metadata).image['containerimage.digest'] }}"
+            digest="${{ fromJSON(steps.build.outputs.metadata)['containerimage.digest'] }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
