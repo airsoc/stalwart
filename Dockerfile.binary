@@ -31,7 +31,7 @@ RUN \
     zig version
 
 RUN curl --retry 5 -fL --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-RUN cargo binstall --no-confirm cargo-chef cargo-zigbuild
+RUN cargo binstall --no-confirm cargo-chef cargo-zigbuild sccache
 
 # zig cc for cross-compilation does not search /usr/include by default,
 # so copy curl headers into zig's own lib/include/ for all-target discovery.
@@ -93,8 +93,7 @@ RUN \
 
 COPY . .
 
-ENV RUSTC_WRAPPER="sccache" \
-    SCCACHE_GHA_ENABLED=true
+ENV RUSTC_WRAPPER="sccache"
 
 RUN \
     --mount=type=secret,id=ACTIONS_RESULTS_URL,env=ACTIONS_RESULTS_URL \
@@ -102,7 +101,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     source /env-cargo && \
-    RUSTFLAGS="-L /usr/lib" cargo zigbuild --release --target ${TARGET} -p stalwart && \
+    RUSTFLAGS="-L /usr/lib" cargo-zigbuild --release --target ${TARGET} -p stalwart && \
     mv /app/target/${TARGET}/release/stalwart /app/artifact/stalwart
 
 # *****************
